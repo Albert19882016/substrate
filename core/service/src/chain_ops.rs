@@ -85,6 +85,7 @@ pub fn export_blocks<F, E, W>(config: FactoryFullConfiguration<F>, exit: E, mut 
 pub fn import_blocks<F, E, R>(config: FactoryFullConfiguration<F>, exit: E, mut input: R) -> error::Result<()>
 	where F: ServiceFactory, E: Future<Item=(),Error=()> + Send + 'static, R: Read,
 {
+	let queue = F::build_import_queue(&config)?;
 	let client = new_client::<F>(config)?;
 
 	let (exit_send, exit_recv) = std::sync::mpsc::channel();
@@ -102,15 +103,7 @@ pub fn import_blocks<F, E, R>(config: FactoryFullConfiguration<F>, exit: E, mut 
 		}
 		match SignedBlock::decode(&mut input) {
 			Some(signed) => {
-				// FIXME: check justification
-				client.import_block(ImportBlock {
-					origin: BlockOrigin::File,
-					header: signed.block.header,
-					external_justification: signed.justification,
-					internal_justification: vec![],
-					body: Some(signed.block.extrinsics),
-					finalized: true
-					}, None)?;
+				queue.import_blocks(BlockOrigin::File, vec![signed.block])?;
 			},
 			None => {
 				warn!("Error reading block data.");
@@ -122,7 +115,7 @@ pub fn import_blocks<F, E, R>(config: FactoryFullConfiguration<F>, exit: E, mut 
 			info!("#{}", block);
 		}
 	}
-	info!("Imported {} blocks. Best: #{}", block, client.info()?.chain.best_number);
+	info!("Imported {} blocks. Best: #{}", block, queue.info()?.chain.best_number);
 
 	Ok(())
 }

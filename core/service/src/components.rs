@@ -139,6 +139,8 @@ pub trait ServiceFactory: 'static + Sized {
 	type FullService: Deref<Target = Service<FullComponents<Self>>> + Send + Sync + 'static;
 	/// Extended light service type.
 	type LightService: Deref<Target = Service<LightComponents<Self>>> + Send + Sync + 'static;
+	/// The Service importing blocks
+	type ImportQueue: network::import_queue::ImportQueue<Self::Block>;
 
 	//TODO: replace these with a constructor trait. that TransactionPool implements.
 	/// Extrinsic pool constructor for the full client.
@@ -147,6 +149,10 @@ pub trait ServiceFactory: 'static + Sized {
 	/// Extrinsic pool constructor for the light client.
 	fn build_light_transaction_pool(config: TransactionPoolOptions, client: Arc<LightClient<Self>>)
 		-> Result<TransactionPool<Self::LightTransactionPoolApi>, error::Error>;
+
+	/// instance of import queue
+	fn build_import_queue(config: &FactoryFullConfiguration<Self>)
+		-> Result<Self::ImportQueue, error::Error>;
 
 	/// Build network protocol.
 	fn build_network_protocol(config: &FactoryFullConfiguration<Self>)

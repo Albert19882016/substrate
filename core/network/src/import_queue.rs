@@ -67,7 +67,7 @@ pub trait ImportQueue<B: BlockT>: Send + Sync {
 	/// Is block with given hash currently in the queue.
 	fn is_importing(&self, hash: &B::Hash) -> bool;
 	/// Import bunch of blocks.
-	fn import_blocks(&self, sync: &mut ChainSync<B>, protocol: &mut Context<B>, blocks: (BlockOrigin, Vec<BlockData<B>>));
+	fn import_blocks(&self, origin: BlockOrigin, blocks: Vec<BlockData<B>>);
 }
 
 /// Import queue status. It isn't completely accurate.
@@ -160,22 +160,22 @@ impl<B: BlockT> ImportQueue<B> for BasicQueue<B> {
 		self.data.queue_blocks.read().contains(hash)
 	}
 
-	fn import_blocks(&self, _sync: &mut ChainSync<B>, _protocol: &mut Context<B>, blocks: (BlockOrigin, Vec<BlockData<B>>)) {
-		if blocks.1.is_empty() {
+	fn import_blocks(&self, origin: BlockOrigin, blocks: Vec<BlockData<B>>) {
+		if blocks.is_empty() {
 			return;
 		}
 
-		trace!(target:"sync", "Scheduling {} blocks for import", blocks.1.len());
+		trace!(target:"sync", "Scheduling {} blocks for import", blocks.len());
 
 		let mut queue = self.data.queue.lock();
 		let mut queue_blocks = self.data.queue_blocks.write();
 		let mut best_importing_number = self.data.best_importing_number.write();
-		let new_best_importing_number = blocks.1.last().and_then(|b| b.block.header.as_ref().map(|h| h.number().clone())).unwrap_or_else(|| Zero::zero());
-		queue_blocks.extend(blocks.1.iter().map(|b| b.block.hash.clone()));
+		let new_best_importing_number = blocks.last().and_then(|b| b.block.header.as_ref().map(|h| h.number().clone())).unwrap_or_else(|| Zero::zero());
+		queue_blocks.extend(blocks.iter().map(|b| b.block.hash.clone()));
 		if new_best_importing_number > *best_importing_number {
 			*best_importing_number = new_best_importing_number;
 		}
-		queue.push_back(blocks);
+		queue.push_back((origin, blocks));
 		self.data.signal.notify_one();
 	}
 }
@@ -478,10 +478,10 @@ impl<'a, B: 'static + BlockT, E: ExecuteInContext<B>> SyncLinkApi<B> for SyncLin
 /// Blocks import queue that is importing blocks in the same thread.
 /// The boolean value indicates whether blocks should be imported without instant finality.
 #[cfg(any(test, feature = "test-helpers"))]
-pub struct SyncImportQueue(pub bool);
+pub struct SyncImportQueue<B: BlockT>(pub bool, pub Arc<Client<B>>);
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue {
+impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue<B> {
 	fn clear(&self) { }
 
 	fn stop(&self) { }
@@ -497,14 +497,20 @@ impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue {
 		false
 	}
 
-	fn import_blocks(&self, sync: &mut ChainSync<B>, protocol: &mut Context<B>, blocks: (BlockOrigin, Vec<BlockData<B>>)) {
-		struct DummyExecuteInContext;
-
-		impl<B: 'static + BlockT> ExecuteInContext<B> for DummyExecuteInContext {
-			fn execute_in_context<F: Fn(&mut Context<B>)>(&self, _closure: F) { }
+	fn import_blocks(&self, origin: BlockOrigin, blocks: Vec<BlockData<B>>) {
+		// We are super consenting: import everything without checks
+		for b in blocks {
+			let block = b.block;
+			self.1.import(ImportBlock {
+				origin,
+				header: block.header.unwrap(),
+				body: block.body,
+				external_justification: block.justification.unwrap_or_default(),
+				internal_justification: vec![],
+				finalized: self.0,
+				auxiliary: vec![],
+				}, None).unwrap();
 		}
-
-		import_many_blocks(&mut SyncLink::Direct::<_, DummyExecuteInContext>(sync, protocol), None, blocks, self.0);
 	}
 }
 

@@ -245,7 +245,7 @@ impl<B: BlockT> ChainSync<B> {
 				self.best_queued_hash = hash;
 			}
 		}
-		import_queue.import_blocks(self, protocol, (origin, new_blocks));
+		import_queue.import_blocks(origin, new_blocks);
 		self.maintain_sync(protocol);
 	}
 

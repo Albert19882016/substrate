@@ -86,9 +86,3 @@ error_chain! {
 		}
 	}
 }
-
-impl From<::rhododendron::InputStreamConcluded> for Error {
-	fn from(_: ::rhododendron::InputStreamConcluded) -> Error {
-		ErrorKind::IoTerminated.into()
-	}
-}

@@ -281,7 +281,7 @@ impl TestNet {
 	pub fn add_peer(&mut self, config: &ProtocolConfig) {
 		let client = Arc::new(test_client::new());
 		let tx_pool = Arc::new(EmptyTransactionPool);
-		let import_queue = Arc::new(SyncImportQueue(false, client.clone()));
+		let import_queue = Arc::new(SyncImportQueue::new(false));
 		let specialization = DummySpecialization {
 			gossip: ConsensusGossip::new(),
 		};

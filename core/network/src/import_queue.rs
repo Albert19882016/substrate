@@ -41,12 +41,16 @@ use protocol::Context;
 use service::ExecuteInContext;
 use sync::ChainSync;
 
+#[cfg(any(test, feature = "test-helpers"))]
+use std::cell::RefCell;
+
 /// Blocks import queue API.
 pub trait ImportQueue<B: BlockT>: Send + Sync {
 	/// Start background work for the queue as necessary.
 	///
 	/// This is called automatically by the network service when synchronization
 	/// begins.
+
 	fn start<E>(
 		&self,
 		_sync: Weak<RwLock<ChainSync<B>>>,
@@ -119,7 +123,12 @@ impl<B: BlockT> AsyncImportQueueData<B> {
 }
 
 impl<B: BlockT> ImportQueue<B> for BasicQueue<B> {
-	fn start<E: 'static + ExecuteInContext<B>>(&self, sync: Weak<RwLock<ChainSync<B>>>, service: Weak<E>, chain: Weak<Client<B>>) -> Result<(), Error> {
+	fn start<E: 'static + ExecuteInContext<B>>(
+		&self,
+		sync: Weak<RwLock<ChainSync<B>>>,
+		service: Weak<E>,
+		chain: Weak<Client<B>>
+	) -> Result<(), Error> {
 		debug_assert!(self.handle.lock().is_none());
 
 		let qdata = self.data.clone();
@@ -216,7 +225,7 @@ fn import_thread<B: BlockT, E: ExecuteInContext<B>>(
 			(Some(sync), Some(service), Some(chain)) => {
 				let blocks_hashes: Vec<B::Hash> = new_blocks.1.iter().map(|b| b.block.hash.clone()).collect();
 				if !import_many_blocks(
-					&mut SyncLink::Indirect(&sync, &*chain, &*service),
+					&mut SyncLink{chain: &sync, client: &*chain, context: &*service},
 					Some(&*qdata),
 					new_blocks,
 					instant_finality,
@@ -235,7 +244,6 @@ fn import_thread<B: BlockT, E: ExecuteInContext<B>>(
 
 	trace!(target: "sync", "Stopping import thread");
 }
-
 /// ChainSync link trait.
 trait SyncLinkApi<B: BlockT> {
 	/// Get chain reference.
@@ -252,13 +260,54 @@ trait SyncLinkApi<B: BlockT> {
 	fn restart(&mut self);
 }
 
+
 /// Link with the ChainSync service.
-enum SyncLink<'a, B: 'a + BlockT, E: 'a + ExecuteInContext<B>> {
-	/// Indirect link (through service).
-	Indirect(&'a RwLock<ChainSync<B>>, &'a Client<B>, &'a E),
-	/// Direct references are given.
-	#[cfg(any(test, feature = "test-helpers"))]
-	Direct(&'a mut ChainSync<B>, &'a mut Context<B>),
+struct SyncLink<'a, B: 'a + BlockT, E: 'a + ExecuteInContext<B>> {
+	pub chain: &'a RwLock<ChainSync<B>>,
+	pub client: &'a Client<B>,
+	pub context: &'a E,
+}
+
+impl<'a, B: 'static + BlockT, E: 'a + ExecuteInContext<B>> SyncLink<'a, B, E> {
+	/// Execute closure with locked ChainSync. 
+	fn with_sync<F: Fn(&mut ChainSync<B>, &mut Context<B>)>(&mut self, closure: F) {
+		let service = self.context;
+		let sync = self.chain;
+		service.execute_in_context(move |protocol| {
+			let mut sync = sync.write();
+			closure(&mut *sync, protocol)
+		});
+	}
+}
+
+impl<'a, B: 'static + BlockT, E: 'a + ExecuteInContext<B>> SyncLinkApi<B> for SyncLink<'a, B, E> {
+
+	fn chain(&self) -> &Client<B> {
+		self.client
+	}
+
+	fn block_imported(&mut self, hash: &B::Hash, number: NumberFor<B>) {
+		self.with_sync(|sync, _| sync.block_imported(&hash, number))
+	}
+
+	fn maintain_sync(&mut self) {
+		self.with_sync(|sync, protocol| sync.maintain_sync(protocol))
+	}
+
+	fn useless_peer(&mut self, who: NodeIndex, reason: &str) {
+		self.with_sync(|_, protocol| protocol.report_peer(who, Severity::Useless(reason)))
+	}
+
+	fn note_useless_and_restart_sync(&mut self, who: NodeIndex, reason: &str) {
+		self.with_sync(|sync, protocol| {
+			protocol.report_peer(who, Severity::Useless(reason));	// is this actually malign or just useless?
+			sync.restart(protocol);
+		})
+	}
+
+	fn restart(&mut self) {
+		self.with_sync(|sync, protocol| sync.restart(protocol))
+	}
 }
 
 /// Block import successful result.
@@ -425,63 +474,64 @@ fn process_import_result<'a, B: BlockT>(
 	}
 }
 
-impl<'a, B: 'static + BlockT, E: 'a + ExecuteInContext<B>> SyncLink<'a, B, E> {
-	/// Execute closure with locked ChainSync.
-	fn with_sync<F: Fn(&mut ChainSync<B>, &mut Context<B>)>(&mut self, closure: F) {
-		match *self {
-			#[cfg(any(test, feature = "test-helpers"))]
-			SyncLink::Direct(ref mut sync, ref mut protocol) =>
-				closure(*sync, *protocol),
-			SyncLink::Indirect(ref sync, _, ref service) =>
-				service.execute_in_context(move |protocol| {
-					let mut sync = sync.write();
-					closure(&mut *sync, protocol)
-				}),
-		}
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub struct ImportCB<B: BlockT>(RefCell<Option<Box<dyn Fn(BlockOrigin, Vec<BlockData<B>>) -> bool>>>);
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl<B: BlockT> ImportCB<B> {
+	pub fn new() -> Self {
+		ImportCB(RefCell::new(None))
+	}
+	pub fn set<F>(&self, cb: Box<F>)
+		where F: 'static + Fn(BlockOrigin, Vec<BlockData<B>>) -> bool
+	{
+		*self.0.borrow_mut() = Some(cb);
+	}
+	pub fn call(&self, origin: BlockOrigin, data: Vec<BlockData<B>>) -> bool {
+		let b = self.0.borrow();
+		b.as_ref().expect("The Callback has been set before. qed.")(origin, data)
 	}
 }
 
-impl<'a, B: 'static + BlockT, E: ExecuteInContext<B>> SyncLinkApi<B> for SyncLink<'a, B, E> {
-	fn chain(&self) -> &Client<B> {
-		match *self {
-			#[cfg(any(test, feature = "test-helpers"))]
-			SyncLink::Direct(_, ref protocol) => protocol.client(),
-			SyncLink::Indirect(_, ref chain, _) => *chain,
-		}
-	}
-
-	fn block_imported(&mut self, hash: &B::Hash, number: NumberFor<B>) {
-		self.with_sync(|sync, _| sync.block_imported(&hash, number))
-	}
-
-	fn maintain_sync(&mut self) {
-		self.with_sync(|sync, protocol| sync.maintain_sync(protocol))
-	}
-
-	fn useless_peer(&mut self, who: NodeIndex, reason: &str) {
-		self.with_sync(|_, protocol| protocol.report_peer(who, Severity::Useless(reason)))
-	}
-
-	fn note_useless_and_restart_sync(&mut self, who: NodeIndex, reason: &str) {
-		self.with_sync(|sync, protocol| {
-			protocol.report_peer(who, Severity::Useless(reason));	// is this actually malign or just useless?
-			sync.restart(protocol);
-		})
-	}
-
-	fn restart(&mut self) {
-		self.with_sync(|sync, protocol| sync.restart(protocol))
-	}
-}
-
+#[cfg(any(test, feature = "test-helpers"))]
+unsafe impl<B: BlockT> Send for ImportCB<B> {}
+#[cfg(any(test, feature = "test-helpers"))]
+unsafe impl<B: BlockT> Sync for ImportCB<B> {}
 
 /// Blocks import queue that is importing blocks in the same thread.
 /// The boolean value indicates whether blocks should be imported without instant finality.
 #[cfg(any(test, feature = "test-helpers"))]
-pub struct SyncImportQueue<B: BlockT>(pub bool, pub Arc<Client<B>>);
+pub struct SyncImportQueue<B: BlockT>(bool, ImportCB<B>);
+#[cfg(any(test, feature = "test-helpers"))]
+impl<B: BlockT> SyncImportQueue<B> {
+	pub fn new(finale: bool) -> Self {
+		SyncImportQueue(finale, ImportCB::new())
+	}
+}
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue<B> {
+impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue<B>
+{
+	fn start<E: 'static + ExecuteInContext<B>>(
+		&self,
+		sync: Weak<RwLock<ChainSync<B>>>,
+		service: Weak<E>,
+		chain: Weak<Client<B>>
+	) -> Result<(), Error> {
+		self.1.set(Box::new(move | origin, new_blocks | {
+			match (sync.upgrade(), service.upgrade(), chain.upgrade()) {
+				(Some(sync), Some(service), Some(chain)) => import_many_blocks(
+						&mut SyncLink{chain: &sync, client: &*chain, context: &*service},
+						None,
+						(origin, new_blocks),
+						true,
+					),
+				_ => false
+			}
+		}));
+		Ok(())
+	}
 	fn clear(&self) { }
 
 	fn stop(&self) { }
@@ -498,19 +548,7 @@ impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue<B> {
 	}
 
 	fn import_blocks(&self, origin: BlockOrigin, blocks: Vec<BlockData<B>>) {
-		// We are super consenting: import everything without checks
-		for b in blocks {
-			let block = b.block;
-			self.1.import(ImportBlock {
-				origin,
-				header: block.header.unwrap(),
-				body: block.body,
-				external_justification: block.justification.unwrap_or_default(),
-				internal_justification: vec![],
-				finalized: self.0,
-				auxiliary: vec![],
-				}, None).unwrap();
-		}
+		self.1.call(origin, blocks);
 	}
 }
 

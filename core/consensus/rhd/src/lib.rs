@@ -64,21 +64,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
 
-use codec::Encode;
-use consensus_common::{Authorities, BlockImport, Environment as BaseEnvironment, Proposer as BaseProposer};
+use codec::{Decode, Encode};
+use consensus_common::{Authorities, BlockImport, Environment, Proposer as BaseProposer};
 use runtime_primitives::{generic::BlockId, Justification};
 use runtime_primitives::traits::{Block, Header};
 use primitives::{AuthorityId, ed25519, ed25519::LocalizedSignature};
 
-use futures::{Async, Stream, Sink, Future, IntoFuture};
+use futures::prelude::*;
 use futures::sync::oneshot;
 use tokio::timer::Delay;
 use parking_lot::Mutex;
 
-use rhododendron::{Action as PrimitiveAction, Message as PrimitiveMessage};
-
-pub use rhododendron::{InputStreamConcluded, AdvanceRoundReason,
-	Message as RhdMessage, Vote as RhdMessageVote};
+pub use rhododendron::{
+	InputStreamConcluded, AdvanceRoundReason, Message as RhdMessage,
+	Vote as RhdMessageVote, Communication as RhdCommunication,
+};
 pub use consensus_common::error::{Error, ErrorKind};
 
 // pub mod misbehaviour_check;
@@ -164,18 +164,6 @@ pub type Communication<B> = rhododendron::Communication<B, <B as Block>::Hash, A
 
 /// Misbehavior observed from BFT participants.
 pub type Misbehavior<H> = rhododendron::Misbehavior<H, LocalizedSignature>;
-
-/// An environment where the needed data is a tuple of communication streams
-/// for messaging.
-pub trait Environment<B: Block>: BaseEnvironment<B> where
-	<Self as BaseEnvironment<B>>::Proposer: Proposer<B>,
-	Self: BaseEnvironment<B, Needed=(Self::Input, Self::Output)>,
-{
-	/// The input stream type.
-	type Input: Stream<Item=Communication<B>, Error=<Self::Proposer as BaseProposer<B>>::Error>;
-	/// The output stream type.
-	type Output: Sink<SinkItem=Communication<B>, SinkError=<Self::Proposer as BaseProposer<B>>::Error>;
-}
 
 /// A proposer for a rhododendron instance. This must implement the base proposer logic.
 pub trait Proposer<B: Block>: BaseProposer<B>
@@ -338,7 +326,7 @@ impl<B, P, I, InStream, OutSink> Future for BftFuture<B, P, I, InStream, OutSink
 	B: Block + Clone + Eq,
 	B::Hash: ::std::hash::Hash,
 	P: Proposer<B>,
-	P::Error: ::std::fmt::Display,
+	P::Error: ::std::fmt::Display + From<InputStreamConcluded>,
 	I: BlockImport<B>,
 	InStream: Stream<Item=Communication<B>, Error=P::Error>,
 	OutSink: Sink<SinkItem=Communication<B>, SinkError=P::Error>,
@@ -400,6 +388,7 @@ impl<B, P, I, InStream, OutSink> Drop for BftFuture<B, P, I, InStream, OutSink> 
 	B: Block + Clone + Eq,
 	B::Hash: ::std::hash::Hash,
 	P: Proposer<B>,
+	P::Error: From<InputStreamConcluded>,
 	InStream: Stream<Item=Communication<B>, Error=P::Error>,
 	OutSink: Sink<SinkItem=Communication<B>, SinkError=P::Error>,
 {
@@ -429,6 +418,9 @@ impl Drop for AgreementHandle {
 	}
 }
 
+/// Type alias for extracting error type from a rhododendron proposer.
+pub type ProposerErrorFor<B, E> = <<E as Environment<B>>::Proposer as BaseProposer<B>>::Error;
+
 /// The BftService kicks off the agreement process on top of any blocks it
 /// is notified of.
 ///
@@ -446,10 +438,10 @@ impl<B, P, I> BftService<B, P, I>
 	where
 		B: Block + Clone + Eq,
 		P: Environment<B>,
-		<P::Proposer as BaseProposer<B>>::Error: ::std::fmt::Display,
+		P::Proposer: Proposer<B>,
+		ProposerErrorFor<B, P>: ::std::fmt::Display + From<InputStreamConcluded>,
 		I: BlockImport<B> + Authorities<B>,
 {
-
 	/// Create a new service instance.
 	pub fn new(client: Arc<I>, key: Arc<ed25519::Pair>, factory: P) -> BftService<B, P, I> {
 		BftService {
@@ -472,20 +464,29 @@ impl<B, P, I> BftService<B, P, I>
 	}
 
 	/// Signal that a valid block with the given header has been imported.
+	/// Provide communication streams that are localized to this block.
+	/// It's recommended to use the communication primitives provided by this
+	/// module for signature checking and decoding. See `CheckedStream` and
+	/// `SigningSink` for more details.
+	///
+	/// Messages received on the stream that don't match the expected format
+	/// will be dropped.
 	///
 	/// If the local signing key is an authority, this will begin the consensus process to build a
 	/// block on top of it. If the executor fails to run the future, an error will be returned.
 	/// Returns `None` if the agreement on the block with given parent is already in progress.
-	pub fn build_upon(&self, header: &B::Header)
+	pub fn build_upon<In, Out>(&self, header: &B::Header, input: In, output: Out)
 		-> Result<Option<
 			BftFuture<
 				B,
 				<P as Environment<B>>::Proposer,
 				I,
-				<P as Environment<B>>::Input,
-				<P as Environment<B>>::Output,
+				In,
+				Out,
 			>>, P::Error>
 		where
+			In: Stream<Item=Communication<B>, Error=ProposerErrorFor<B, P>>,
+			Out: Sink<SinkItem=Communication<B>, SinkError=ProposerErrorFor<B, P>>,
 	{
 		let hash = header.hash();
 
@@ -512,7 +513,7 @@ impl<B, P, I> BftService<B, P, I>
 			Err(ErrorKind::InvalidAuthority(local_id).into())?;
 		}
 
-		let (proposer, (input, output)) = self.factory.init(header, &authorities, self.key.clone())?;
+		let proposer = self.factory.init(header, &authorities, self.key.clone())?;
 
 		let bft_instance = BftInstance {
 			proposer,
@@ -592,6 +593,94 @@ impl<B, P, I> BftService<B, P, I>
 	}
 }
 
+/// Stream that decodes rhododendron messages and checks signatures.
+///
+/// This stream is localized to a specific parent block-hash, as all messages
+/// will be signed in a way that accounts for it. When using this with
+/// `BftService::build_upon`, the user should take care to use the same hash as for that.
+pub struct CheckedStream<B: Block, S> {
+	inner: S,
+	local_id: AuthorityId,
+	authorities: Vec<AuthorityId>,
+	parent_hash: B::Hash,
+}
+
+impl<B: Block, S> CheckedStream<B, S> {
+	/// Construct a new checked stream.
+	pub fn new(
+		inner: S,
+		local_id: AuthorityId,
+		authorities: Vec<AuthorityId>,
+		parent_hash: B::Hash,
+	) -> Self {
+		CheckedStream {
+			inner,
+			local_id,
+			authorities,
+			parent_hash,
+		}
+	}
+}
+
+impl<B: Block, S: Stream<Item=Vec<u8>>> Stream for CheckedStream<B, S>
+	where S::Error: From<InputStreamConcluded>,
+{
+	type Item = Communication<B>;
+	type Error = S::Error;
+
+	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+		use rhododendron::LocalizedMessage as RhdLocalized;
+		loop {
+			match self.inner.poll()? {
+				Async::Ready(Some(item)) => {
+					let comms: Communication<B> = match Decode::decode(&mut &item[..]) {
+						Some(x) => x,
+						None => continue,
+					};
+
+					match comms {
+						RhdCommunication::Auxiliary(prepare_just) => {
+							let checked = check_prepare_justification::<B>(
+								&self.authorities,
+								self.parent_hash,
+								UncheckedJustification(prepare_just.uncheck()),
+							);
+							if let Ok(checked) = checked {
+								return RhdCommunication::Auxiliary(checked.0);
+							}
+						}
+						RhdCommunication::Consensus(RhdLocalized::Propose(p)) => {
+							let checked = check_proposal::<B>(
+								&self.authorities,
+								&self.parent_hash,
+								&p,
+							);
+
+							if let Ok(()) = checked {
+								return RhdCommunication::Consensus(RhdLocalized::Propose(p));
+							}
+						}
+						RhdCommunication::Consensus(RhdLocalized::Vote(v)) => {
+							let checked = check_vote::<B>(
+								&self.authorities,
+								&self.parent_hash,
+								&v,
+							);
+
+							if let Ok(()) = checked {
+								return RhdCommunication::Consensus(RhdLocalized::Vote(v));
+							}
+						}
+					}
+				}
+				Async::Ready(None) => return Async::Ready(None),
+				Async::NotReady => return Ok(Async::NotReady),
+			}
+		}
+	}
+}
+
+/// Convert an input-stream-concluded error into an error.
 pub fn input_stream_concluded(_: ::rhododendron::InputStreamConcluded) -> Error {
 	ErrorKind::IoTerminated.into()
 }
@@ -606,6 +695,22 @@ pub fn max_faulty_of(n: usize) -> usize {
 /// This will always be over 2/3.
 pub fn bft_threshold(n: usize) -> usize {
 	n - max_faulty_of(n)
+}
+
+// actions in the signature scheme.
+#[derive(Encode)]
+enum Action<B: Block> {
+	Prepare(u32, B::Hash),
+	Commit(u32, B::Hash),
+	AdvanceRound(u32),
+	// signatures of header hash and full candidate are both included.
+	ProposeHeader(u32, B::Hash),
+	Propose(u32, B),
+}
+
+// encode something in a way which is localized to a specific parent-hash
+fn localized_encode<H: Encode, E: Encode>(parent_hash: H, value: E) -> Vec<u8> {
+	(parent_hash, value).encode()
 }
 
 fn check_justification_signed_message<H>(
@@ -635,10 +740,8 @@ pub fn check_justification<B: Block>(
 	parent: B::Hash,
 	just: UncheckedJustification<B::Hash>
 ) -> Result<RhdJustification<B::Hash>, UncheckedJustification<B::Hash>> {
-	let message = Encode::encode(&LocalizedMessage::<B, _> {
-		parent,
-		action: PrimitiveAction::Commit(just.0.round_number as u32, just.0.digest.clone()),
-	});
+	let vote = Action::<B>::Commit(just.0.round_number as u32, just.0.digest.clone());
+	let message = localized_encode(parent, vote);
 
 	check_justification_signed_message(authorities, &message[..], just)
 }
@@ -650,10 +753,8 @@ pub fn check_justification<B: Block>(
 pub fn check_prepare_justification<B: Block>(authorities: &[AuthorityId], parent: B::Hash, just: UncheckedJustification<B::Hash>)
 	-> Result<PrepareJustification<B::Hash>, UncheckedJustification<B::Hash>>
 {
-	let message = Encode::encode(&PrimitiveMessage::<B, _> {
-		parent,
-		action: PrimitiveAction::Prepare(just.0.round_number as u32, just.0.digest.clone()),
-	});
+	let vote = Action::<B>::Prepare(just.0.round_number as u32, just.0.digest.clone());
+	let message = localized_encode(parent, vote);
 
 	check_justification_signed_message(authorities, &message[..], just).map(|e| PrepareJustification(e.0))
 }
@@ -670,8 +771,8 @@ pub fn check_proposal<B: Block + Clone>(
 		return Err(ErrorKind::InvalidAuthority(propose.sender.into()).into());
 	}
 
-	let action_header = PrimitiveAction::ProposeHeader(propose.round_number as u32, propose.digest.clone());
-	let action_propose = PrimitiveAction::Propose(propose.round_number as u32, propose.proposal.clone());
+	let action_header = Action::ProposeHeader(propose.round_number as u32, propose.digest.clone());
+	let action_propose = Action::Propose(propose.round_number as u32, propose.proposal.clone());
 	check_action::<B>(action_header, parent_hash, &propose.digest_signature)?;
 	check_action::<B>(action_propose, parent_hash, &propose.full_signature)
 }
@@ -689,20 +790,15 @@ pub fn check_vote<B: Block>(
 	}
 
 	let action = match vote.vote {
-		::rhododendron::Vote::Prepare(r, ref h) => PrimitiveAction::Prepare(r as u32, h.clone()),
-		::rhododendron::Vote::Commit(r, ref h) => PrimitiveAction::Commit(r as u32, h.clone()),
-		::rhododendron::Vote::AdvanceRound(r) => PrimitiveAction::AdvanceRound(r as u32),
+		::rhododendron::Vote::Prepare(r, ref h) => Action::Prepare(r as u32, h.clone()),
+		::rhododendron::Vote::Commit(r, ref h) => Action::Commit(r as u32, h.clone()),
+		::rhododendron::Vote::AdvanceRound(r) => Action::AdvanceRound(r as u32),
 	};
 	check_action::<B>(action, parent_hash, &vote.signature)
 }
 
-fn check_action<B: Block>(action: PrimitiveAction<B, B::Hash>, parent_hash: &B::Hash, sig: &LocalizedSignature) -> Result<(), Error> {
-	let primitive = PrimitiveMessage {
-		parent: parent_hash.clone(),
-		action,
-	};
-
-	let message = Encode::encode(&primitive);
+fn check_action<B: Block>(action: Action<B>, parent_hash: &B::Hash, sig: &LocalizedSignature) -> Result<(), Error> {
+	let message = localized_encode(*parent_hash, action);
 	if ed25519::verify_strong(&sig.signature, &message, &sig.signer) {
 		Ok(())
 	} else {
@@ -718,13 +814,9 @@ pub fn sign_message<B: Block + Clone>(
 ) -> LocalizedMessage<B> {
 	let signer = key.public();
 
-	let sign_action = |action: ::rhododendron::Vote<B>| {
-		let primitive = ::rhododendron::LocalizedVote {
-			parent: parent_hash.clone(),
-			action,
-		};
+	let sign_action = |action: Action<B>| {
+		let to_sign = localized_encode(parent_hash.clone(), action);
 
-		let to_sign = Encode::encode(&primitive);
 		LocalizedSignature {
 			signer: signer.clone(),
 			signature: key.sign(&to_sign),
@@ -734,8 +826,8 @@ pub fn sign_message<B: Block + Clone>(
 	match message {
 		RhdMessage::Propose(r, proposal) => {
 			let header_hash = proposal.hash();
-			let action_header = ::rhododendron::ProposeHeader(r as u32, header_hash.clone());
-			let action_propose = ::rhododendron::Propose(r as u32, proposal.clone());
+			let action_header = Action::ProposeHeader(r as u32, header_hash.clone());
+			let action_propose = Action::Propose(r as u32, proposal.clone());
 
 			::rhododendron::LocalizedMessage::Propose(::rhododendron::LocalizedProposal {
 				round_number: r,
@@ -746,13 +838,19 @@ pub fn sign_message<B: Block + Clone>(
 				full_signature: sign_action(action_propose),
 			})
 		}
-		RhdMessage::Vote(vote) => ::rhododendron::LocalizedMessage::Vote(
+		RhdMessage::Vote(vote) => ::rhododendron::LocalizedMessage::Vote({
+			let action = match vote {
+				RhdMessageVote::Prepare(r, h) => Action::Prepare(r as u32, h),
+				RhdMessageVote::Commit(r, h) => Action::Commit(r as u32, h),
+				RhdMessageVote::AdvanceRound(r) => Action::AdvanceRound(r as u32),
+			};
+
 			::rhododendron::LocalizedVote {
 				vote: vote,
 				sender: signer.clone().into(),
 				signature: sign_action(action),
 			}
-		)
+		})
 	}
 }
 

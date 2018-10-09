@@ -53,15 +53,12 @@ pub trait Authorities<B: Block> {
 pub trait Environment<B: Block> {
 	/// The proposer type this creates.
 	type Proposer: Proposer<B>;
-	/// Needed data for running with this environment in a consensus system.
-	type Needed;
 	/// Error which can occur upon creation.
 	type Error: From<Error>;
 
 	/// Initialize the proposal logic on top of a specific header.
-	/// Produces the proposer and needed data for that
 	fn init(&self, parent_header: &B::Header, authorities: &[AuthorityId], sign_with: Arc<ed25519::Pair>)
-		-> Result<(Self::Proposer, Self::Needed), Self::Error>;
+		-> Result<Self::Proposer, Self::Error>;
 }
 
 /// Logic for a proposer.

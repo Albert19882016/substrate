@@ -183,7 +183,7 @@ impl<'a, B: BlockT + 'a, H: ExHashT + 'a> Context<B> for ProtocolContext<'a, B, 
 pub(crate) struct ContextData<B: BlockT, H: ExHashT> {
 	// All connected peers
 	peers: RwLock<HashMap<NodeIndex, Peer<B, H>>>,
-	chain: Arc<Client<B>>,
+	pub chain: Arc<Client<B>>,
 }
 
 impl<B: BlockT, S: Specialization<B>, H: ExHashT> Protocol<B, S, H> {
@@ -375,7 +375,19 @@ impl<B: BlockT, S: Specialization<B>, H: ExHashT> Protocol<B, S, H> {
 		trace!(target: "sync", "BlockResponse {} from {} with {} blocks{}",
 			response.id, peer, response.blocks.len(), blocks_range);
 
-		self.sync.write().on_block_data(&mut ProtocolContext::new(&self.context_data, io), peer, request, response);
+		// import_queue.import_blocks also acquires sync.write();
+		// Break the cycle by doing these separately from the outside;
+		let new_blocks = {
+			let mut sync = self.sync.write();
+			sync.on_block_data(&mut ProtocolContext::new(&self.context_data, io), peer, request, response)
+		};
+
+		if let Some((origin, new_blocks)) =  new_blocks {
+			let import_queue = self.sync.read().import_queue();
+			import_queue.import_blocks(origin, new_blocks);
+		}
+
+
 	}
 
 	/// Perform time based maintenance.

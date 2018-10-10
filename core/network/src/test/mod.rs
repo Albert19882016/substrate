@@ -27,7 +27,7 @@ use client;
 use client::block_builder::BlockBuilder;
 use runtime_primitives::generic::BlockId;
 use io::SyncIo;
-use protocol::{Context, Protocol};
+use protocol::{Context, Protocol, ProtocolContext};
 use primitives::{Blake2Hasher};
 use config::ProtocolConfig;
 use service::TransactionPool;
@@ -38,8 +38,22 @@ use import_queue::SyncImportQueue;
 use test_client::{self, TestClient};
 use specialization::Specialization;
 use consensus_gossip::ConsensusGossip;
+use import_queue::ImportQueue;
+use service::ExecuteInContext;
 
 pub use test_client::runtime::{Block, Hash, Transfer, Extrinsic};
+
+struct DummyContextExecutor(Arc<Protocol<Block, DummySpecialization, Hash>>, Arc<RwLock<VecDeque<TestPacket>>>);
+unsafe impl Send for DummyContextExecutor {}
+unsafe impl Sync for DummyContextExecutor {}
+
+impl ExecuteInContext<Block> for DummyContextExecutor {
+	fn execute_in_context<F: Fn(&mut Context<Block>)>(&self, closure: F) {
+		let mut io = TestIo::new(&self.1, None);
+		let mut context = ProtocolContext::new(&self.0.context_data(), &mut io);
+		closure(&mut context);
+	}
+}
 
 /// The test specialization.
 pub struct DummySpecialization {
@@ -126,16 +140,31 @@ pub struct TestPacket {
 
 pub struct Peer {
 	client: Arc<client::Client<test_client::Backend, test_client::Executor, Block>>,
-	pub sync: Protocol<Block, DummySpecialization, Hash>,
-	pub queue: RwLock<VecDeque<TestPacket>>,
+	pub sync: Arc<Protocol<Block, DummySpecialization, Hash>>,
+	pub queue: Arc<RwLock<VecDeque<TestPacket>>>,
+	import_queue: Arc<SyncImportQueue<Block>>,
+	executor: Arc<DummyContextExecutor>,
 }
 
 impl Peer {
+	fn new(
+		client: Arc<client::Client<test_client::Backend, test_client::Executor, Block>>,
+		sync: Arc<Protocol<Block, DummySpecialization, Hash>>,
+		queue: Arc<RwLock<VecDeque<TestPacket>>>,
+		import_queue: Arc<SyncImportQueue<Block>>,
+	) -> Self {
+		let executor = Arc::new(DummyContextExecutor(sync.clone(), queue.clone()));
+		Peer { client, sync, queue, import_queue, executor}
+	}
 	/// Called after blockchain has been populated to updated current state.
 	fn start(&self) {
 		// Update the sync state to the latest chain state.
 		let info = self.client.info().expect("In-mem client does not fail");
 		let header = self.client.header(&BlockId::Hash(info.chain.best_hash)).unwrap().unwrap();
+		self.import_queue.start(
+				Arc::downgrade(&self.sync.sync()),
+				Arc::downgrade(&self.executor),
+				Arc::downgrade(&self.sync.context_data().chain)).expect("Test ImportQueue always starts");
 		self.sync.on_block_imported(&mut TestIo::new(&self.queue, None), info.chain.best_hash, &header);
 	}
 
@@ -288,17 +317,18 @@ impl TestNet {
 		let sync = Protocol::new(
 			config.clone(),
 			client.clone(),
-			import_queue,
+			import_queue.clone(),
 			None,
 			tx_pool,
 			specialization
 		).unwrap();
 
-		self.peers.push(Arc::new(Peer {
-			sync: sync,
-			client: client,
-			queue: RwLock::new(VecDeque::new()),
-		}));
+		self.peers.push(Arc::new(Peer::new(
+			client,
+			Arc::new(sync),
+			Arc::new(RwLock::new(VecDeque::new())),
+			import_queue
+		)));
 	}
 
 	/// Get reference to peer.

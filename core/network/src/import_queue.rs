@@ -350,7 +350,7 @@ fn import_many_blocks<'a, B: BlockT>(
 			(Some(first), Some(_)) => format!(" ({})", first),
 			_ => Default::default(),
 		};
-	trace!(target:"sync", "Starting import of {} blocks{}", count, blocks_range);
+	trace!(target:"sync", "Starting import of {} blocks {}", count, blocks_range);
 
 	// Blocks in the response/drain should be in ascending order.
 	for block in blocks {

@@ -34,7 +34,7 @@ use service::TransactionPool;
 use network_libp2p::{NodeIndex, SessionInfo, Severity};
 use keyring::Keyring;
 use codec::Encode;
-use import_queue::SyncImportQueue;
+use import_queue::{SyncImportQueue, PassThroughVerifier};
 use test_client::{self, TestClient};
 use specialization::Specialization;
 use consensus_gossip::ConsensusGossip;
@@ -142,7 +142,7 @@ pub struct Peer {
 	client: Arc<client::Client<test_client::Backend, test_client::Executor, Block>>,
 	pub sync: Arc<Protocol<Block, DummySpecialization, Hash>>,
 	pub queue: Arc<RwLock<VecDeque<TestPacket>>>,
-	import_queue: Arc<SyncImportQueue<Block>>,
+	import_queue: Arc<SyncImportQueue<Block, PassThroughVerifier>>,
 	executor: Arc<DummyContextExecutor>,
 }
 
@@ -151,7 +151,7 @@ impl Peer {
 		client: Arc<client::Client<test_client::Backend, test_client::Executor, Block>>,
 		sync: Arc<Protocol<Block, DummySpecialization, Hash>>,
 		queue: Arc<RwLock<VecDeque<TestPacket>>>,
-		import_queue: Arc<SyncImportQueue<Block>>,
+		import_queue: Arc<SyncImportQueue<Block, PassThroughVerifier>>,
 	) -> Self {
 		let executor = Arc::new(DummyContextExecutor(sync.clone(), queue.clone()));
 		Peer { client, sync, queue, import_queue, executor}
@@ -310,7 +310,7 @@ impl TestNet {
 	pub fn add_peer(&mut self, config: &ProtocolConfig) {
 		let client = Arc::new(test_client::new());
 		let tx_pool = Arc::new(EmptyTransactionPool);
-		let import_queue = Arc::new(SyncImportQueue::new(false));
+		let import_queue = Arc::new(SyncImportQueue::new(Arc::new(PassThroughVerifier(true))));
 		let specialization = DummySpecialization {
 			gossip: ConsensusGossip::new(),
 		};

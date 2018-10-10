@@ -31,6 +31,7 @@ use parking_lot::{Condvar, Mutex, RwLock};
 
 use client::{BlockOrigin, ImportBlock, ImportResult};
 use network_libp2p::{NodeIndex, Severity};
+use primitives::AuthorityId;
 
 use runtime_primitives::traits::{Block as BlockT, Header as HeaderT, NumberFor, Zero};
 
@@ -43,6 +44,20 @@ use sync::ChainSync;
 
 #[cfg(any(test, feature = "test-helpers"))]
 use std::cell::RefCell;
+
+/// Verify a justification of a block
+pub trait Verifier<B: BlockT>: Send + Sync + Sized {
+	/// Verify the given data and return the ImportBlock and an optional
+	/// new set of validators to import. If not, err with an Error-Message
+	/// presented to the User in the logs.
+	fn verify(
+		&self,
+		origin: BlockOrigin,
+		header: B::Header,
+		justification: Vec<u8>,
+		body: Option<Vec<B::Extrinsic>>
+	) -> Result<(ImportBlock<B>, Option<Vec<AuthorityId>>), String>;
+}
 
 /// Blocks import queue API.
 pub trait ImportQueue<B: BlockT>: Send + Sync {
@@ -84,10 +99,10 @@ pub struct ImportQueueStatus<B: BlockT> {
 
 /// Basic block import queue that is importing blocks sequentially in a separate thread,
 /// with pluggable verification.
-pub struct BasicQueue<B: BlockT> {
+pub struct BasicQueue<B: BlockT, V: 'static + Verifier<B>> {
 	handle: Mutex<Option<::std::thread::JoinHandle<()>>>,
 	data: Arc<AsyncImportQueueData<B>>,
-	instant_finality: bool,
+	verifier: Arc<V>,
 }
 
 /// Locks order: queue, queue_blocks, best_importing_number
@@ -99,13 +114,13 @@ struct AsyncImportQueueData<B: BlockT> {
 	is_stopping: AtomicBool,
 }
 
-impl<B: BlockT> BasicQueue<B> {
+impl<B: BlockT, V: Verifier<B>> BasicQueue<B, V> {
 	/// Instantiate a new basic queue, with given verifier.
-	pub fn new(instant_finality: bool) -> Self {
+	pub fn new(verifier: Arc<V>) -> Self {
 		Self {
 			handle: Mutex::new(None),
 			data: Arc::new(AsyncImportQueueData::new()),
-			instant_finality,
+			verifier,
 		}
 	}
 }
@@ -122,7 +137,7 @@ impl<B: BlockT> AsyncImportQueueData<B> {
 	}
 }
 
-impl<B: BlockT> ImportQueue<B> for BasicQueue<B> {
+impl<B: BlockT, V: 'static + Verifier<B>> ImportQueue<B> for BasicQueue<B, V> {
 	fn start<E: 'static + ExecuteInContext<B>>(
 		&self,
 		sync: Weak<RwLock<ChainSync<B>>>,
@@ -132,9 +147,9 @@ impl<B: BlockT> ImportQueue<B> for BasicQueue<B> {
 		debug_assert!(self.handle.lock().is_none());
 
 		let qdata = self.data.clone();
-		let instant_finality = self.instant_finality;
+		let verifier = self.verifier.clone();
 		*self.handle.lock() = Some(::std::thread::Builder::new().name("ImportQueue".into()).spawn(move || {
-			import_thread(sync, service, chain, qdata, instant_finality)
+			import_thread(sync, service, chain, qdata, verifier)
 		}).map_err(|err| Error::from(ErrorKind::Io(err)))?);
 		Ok(())
 	}
@@ -189,19 +204,19 @@ impl<B: BlockT> ImportQueue<B> for BasicQueue<B> {
 	}
 }
 
-impl<B: BlockT> Drop for BasicQueue<B> {
+impl<B: BlockT, V: 'static + Verifier<B>> Drop for BasicQueue<B, V> {
 	fn drop(&mut self) {
 		self.stop();
 	}
 }
 
 /// Blocks import thread.
-fn import_thread<B: BlockT, E: ExecuteInContext<B>>(
+fn import_thread<B: BlockT, E: ExecuteInContext<B>, V: Verifier<B>>(
 	sync: Weak<RwLock<ChainSync<B>>>,
 	service: Weak<E>,
 	chain: Weak<Client<B>>,
 	qdata: Arc<AsyncImportQueueData<B>>,
-	instant_finality: bool,
+	verifier: Arc<V>
 ) {
 	trace!(target: "sync", "Starting import thread");
 	loop {
@@ -228,7 +243,7 @@ fn import_thread<B: BlockT, E: ExecuteInContext<B>>(
 					&mut SyncLink{chain: &sync, client: &*chain, context: &*service},
 					Some(&*qdata),
 					new_blocks,
-					instant_finality,
+					verifier.clone(),
 				) {
 					break;
 				}
@@ -331,11 +346,11 @@ enum BlockImportError {
 }
 
 /// Import a bunch of blocks.
-fn import_many_blocks<'a, B: BlockT>(
+fn import_many_blocks<'a, B: BlockT, V: Verifier<B>>(
 	link: &mut SyncLinkApi<B>,
 	qdata: Option<&AsyncImportQueueData<B>>,
 	blocks: (BlockOrigin, Vec<BlockData<B>>),
-	instant_finality: bool,
+	verifier: Arc<V>
 ) -> bool
 {
 	let (blocks_origin, blocks) = blocks;
@@ -358,7 +373,7 @@ fn import_many_blocks<'a, B: BlockT>(
 			link.chain(),
 			blocks_origin.clone(),
 			block,
-			instant_finality,
+			verifier.clone(),
 		);
 		let is_import_failed = import_result.is_err();
 		imported += process_import_result(link, import_result);
@@ -378,64 +393,61 @@ fn import_many_blocks<'a, B: BlockT>(
 }
 
 /// Single block import function.
-fn import_single_block<B: BlockT>(
+fn import_single_block<B: BlockT, V: Verifier<B>>(
 	chain: &Client<B>,
 	block_origin: BlockOrigin,
 	block: BlockData<B>,
-	instant_finality: bool,
+	verifier: Arc<V>
 ) -> Result<BlockImportResult<B::Hash, <<B as BlockT>::Header as HeaderT>::Number>, BlockImportError>
 {
-	let origin = block.origin;
+	let peer = block.origin;
 	let block = block.block;
-	match (block.header, block.justification) {
-		(Some(header), Some(justification)) => {
-			let number = header.number().clone();
-			let hash = header.hash();
-			let parent = header.parent_hash().clone();
 
-			let result = chain.import(ImportBlock {
-				origin: block_origin,
-				header: header,
-				external_justification: justification,
-				internal_justification: vec![],
-				body: block.body,
-				finalized: instant_finality,
-				auxiliary: Vec::new(),
-			}, None);
-			match result {
-				Ok(ImportResult::AlreadyInChain) => {
-					trace!(target: "sync", "Block already in chain {}: {:?}", number, hash);
-					Ok(BlockImportResult::ImportedKnown(hash, number))
-				},
-				Ok(ImportResult::AlreadyQueued) => {
-					trace!(target: "sync", "Block already queued {}: {:?}", number, hash);
-					Ok(BlockImportResult::ImportedKnown(hash, number))
-				},
-				Ok(ImportResult::Queued) => {
-					trace!(target: "sync", "Block queued {}: {:?}", number, hash);
-					Ok(BlockImportResult::ImportedUnknown(hash, number))
-				},
-				Ok(ImportResult::UnknownParent) => {
-					debug!(target: "sync", "Block with unknown parent {}: {:?}, parent: {:?}", number, hash, parent);
-					Err(BlockImportError::Restart)
-				},
-				Ok(ImportResult::KnownBad) => {
-					debug!(target: "sync", "Peer gave us a bad block {}: {:?}", number, hash);
-					Err(BlockImportError::DisconnectAndRestart(origin)) //TODO: use persistent ID
-				}
-				Err(e) => {
-					debug!(target: "sync", "Error importing block {}: {:?}: {:?}", number, hash, e);
-					Err(BlockImportError::Restart)
-				}
-			}
-		},
+	let (header, justification) = match (block.header, block.justification) {
+		(Some(header), Some(justification)) => (header, justification),
 		(None, _) => {
-			debug!(target: "sync", "Header {} was not provided by {} ", block.hash, origin);
-			Err(BlockImportError::Disconnect(origin)) //TODO: use persistent ID
+			debug!(target: "sync", "Header {} was not provided by {} ", block.hash, peer);
+			return Err(BlockImportError::Disconnect(peer)) //TODO: use persistent ID
 		},
 		(_, None) => {
-			debug!(target: "sync", "Justification set for block {} was not provided by {} ", block.hash, origin);
-			Err(BlockImportError::Disconnect(origin)) //TODO: use persistent ID
+			debug!(target: "sync", "Justification set for block {} was not provided by {} ", block.hash, peer);
+			return Err(BlockImportError::Disconnect(peer)) //TODO: use persistent ID
+		}
+	};
+
+	let number = header.number().clone();
+	let hash = header.hash();
+	let parent = header.parent_hash().clone();
+	let (import_block, new_authorities) = verifier.verify(block_origin, header, justification, block.body)
+		.map_err(|e| {
+			warn!(target: "sync", "Verifying {}({}) from {} failed: {}", number, hash, peer, e);
+			BlockImportError::Disconnect(peer)
+		})?;
+
+	match chain.import(import_block, new_authorities) {
+		Ok(ImportResult::AlreadyInChain) => {
+			trace!(target: "sync", "Block already in chain {}: {:?}", number, hash);
+			Ok(BlockImportResult::ImportedKnown(hash, number))
+		},
+		Ok(ImportResult::AlreadyQueued) => {
+			trace!(target: "sync", "Block already queued {}: {:?}", number, hash);
+			Ok(BlockImportResult::ImportedKnown(hash, number))
+		},
+		Ok(ImportResult::Queued) => {
+			trace!(target: "sync", "Block queued {}: {:?}", number, hash);
+			Ok(BlockImportResult::ImportedUnknown(hash, number))
+		},
+		Ok(ImportResult::UnknownParent) => {
+			debug!(target: "sync", "Block with unknown parent {}: {:?}, parent: {:?}", number, hash, parent);
+			Err(BlockImportError::Restart)
+		},
+		Ok(ImportResult::KnownBad) => {
+			debug!(target: "sync", "Peer gave us a bad block {}: {:?}", number, hash);
+			Err(BlockImportError::DisconnectAndRestart(peer)) //TODO: use persistent ID
+		}
+		Err(e) => {
+			debug!(target: "sync", "Error importing block {}: {:?}: {:?}", number, hash, e);
+			Err(BlockImportError::Restart)
 		}
 	}
 }
@@ -499,19 +511,51 @@ unsafe impl<B: BlockT> Send for ImportCB<B> {}
 #[cfg(any(test, feature = "test-helpers"))]
 unsafe impl<B: BlockT> Sync for ImportCB<B> {}
 
-/// Blocks import queue that is importing blocks in the same thread.
-/// The boolean value indicates whether blocks should be imported without instant finality.
+
 #[cfg(any(test, feature = "test-helpers"))]
-pub struct SyncImportQueue<B: BlockT>(bool, ImportCB<B>);
+pub struct PassThroughVerifier(pub bool);
+
 #[cfg(any(test, feature = "test-helpers"))]
-impl<B: BlockT> SyncImportQueue<B> {
-	pub fn new(finale: bool) -> Self {
-		SyncImportQueue(finale, ImportCB::new())
+/// This Verifiyer accepts all data as valid
+impl<B: BlockT> Verifier<B> for PassThroughVerifier {
+	fn verify(
+		&self,
+		origin: BlockOrigin,
+		header: B::Header,
+		justification: Vec<u8>,
+		body: Option<Vec<B::Extrinsic>>
+	) -> Result<(ImportBlock<B>, Option<Vec<AuthorityId>>), String> {
+		Ok((ImportBlock {
+			origin,
+			header,
+			body,
+			finalized: self.0,
+			external_justification: justification,
+			internal_justification: vec![],
+			auxiliary: Vec::new(),
+		}, None))
 	}
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
-impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue<B>
+unsafe impl Send for PassThroughVerifier {}
+#[cfg(any(test, feature = "test-helpers"))]
+unsafe impl Sync for PassThroughVerifier {}
+
+
+#[cfg(any(test, feature = "test-helpers"))]
+/// Blocks import queue that is importing blocks in the same thread.
+/// The boolean value indicates whether blocks should be imported without instant finality.
+pub struct SyncImportQueue<B: BlockT, V: Verifier<B>>(Arc<V>, ImportCB<B>);
+#[cfg(any(test, feature = "test-helpers"))]
+impl<B: BlockT, V: Verifier<B>> SyncImportQueue<B, V> {
+	pub fn new(verifier: Arc<V>) -> Self {
+		SyncImportQueue(verifier, ImportCB::new())
+	}
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl<B: 'static + BlockT, V: 'static + Verifier<B>> ImportQueue<B> for SyncImportQueue<B, V>
 {
 	fn start<E: 'static + ExecuteInContext<B>>(
 		&self,
@@ -519,13 +563,16 @@ impl<B: 'static + BlockT> ImportQueue<B> for SyncImportQueue<B>
 		service: Weak<E>,
 		chain: Weak<Client<B>>
 	) -> Result<(), Error> {
+		let v = self.0.clone();
 		self.1.set(Box::new(move | origin, new_blocks | {
+			let verifier = v.clone();
 			match (sync.upgrade(), service.upgrade(), chain.upgrade()) {
-				(Some(sync), Some(service), Some(chain)) => import_many_blocks(
+				(Some(sync), Some(service), Some(chain)) =>
+					import_many_blocks(
 						&mut SyncLink{chain: &sync, client: &*chain, context: &*service},
 						None,
 						(origin, new_blocks),
-						true,
+						verifier,
 					),
 				_ => false
 			}
@@ -618,7 +665,7 @@ pub mod tests {
 	fn import_single_good_block_works() {
 		let (_, hash, number, block) = prepare_good_block();
 		assert_eq!(
-			import_single_block(&test_client::new(), BlockOrigin::File, block, true),
+			import_single_block(&test_client::new(), BlockOrigin::File, block, Arc::new(PassThroughVerifier(true))),
 			Ok(BlockImportResult::ImportedUnknown(hash, number))
 		);
 	}
@@ -627,7 +674,7 @@ pub mod tests {
 	fn import_single_good_known_block_is_ignored() {
 		let (client, hash, number, block) = prepare_good_block();
 		assert_eq!(
-			import_single_block(&client, BlockOrigin::File, block, true),
+			import_single_block(&client, BlockOrigin::File, block, Arc::new(PassThroughVerifier(true))),
 			Ok(BlockImportResult::ImportedKnown(hash, number))
 		);
 	}
@@ -637,7 +684,7 @@ pub mod tests {
 		let (_, _, _, mut block) = prepare_good_block();
 		block.block.header = None;
 		assert_eq!(
-			import_single_block(&test_client::new(), BlockOrigin::File, block, true),
+			import_single_block(&test_client::new(), BlockOrigin::File, block, Arc::new(PassThroughVerifier(true))),
 			Err(BlockImportError::Disconnect(0))
 		);
 	}
@@ -647,7 +694,7 @@ pub mod tests {
 		let (_, _, _, mut block) = prepare_good_block();
 		block.block.justification = None;
 		assert_eq!(
-			import_single_block(&test_client::new(), BlockOrigin::File, block, true),
+			import_single_block(&test_client::new(), BlockOrigin::File, block, Arc::new(PassThroughVerifier(true))),
 			Err(BlockImportError::Disconnect(0))
 		);
 	}
@@ -689,18 +736,20 @@ pub mod tests {
 	fn import_many_blocks_stops_when_stopping() {
 		let (_, _, _, block) = prepare_good_block();
 		let qdata = AsyncImportQueueData::new();
+		let verifier = Arc::new(PassThroughVerifier(true));
 		qdata.is_stopping.store(true, Ordering::SeqCst);
 		assert!(!import_many_blocks(
 			&mut TestLink::new(),
 			Some(&qdata),
 			(BlockOrigin::File, vec![block.clone(), block]),
-			true
+			verifier
 		));
 	}
 
 	#[test]
 	fn async_import_queue_drops() {
-		let queue = BasicQueue::new(true);
+		let verifier = Arc::new(PassThroughVerifier(true));
+		let queue = BasicQueue::new(verifier);
 		let service = Arc::new(DummyExecutor);
 		let chain = Arc::new(test_client::new());
 		queue.start(Weak::new(), Arc::downgrade(&service), Arc::downgrade(&chain) as Weak<Client<Block>>).unwrap();

@@ -1858,14 +1858,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "parity-codec"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-dependencies = [
- "arrayvec 0.4.7 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "parity-codec"
 version = "2.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
@@ -2225,23 +2217,23 @@ dependencies = [
 [[package]]
 name = "rhododendron"
 version = "0.3.4"
-source = "git+https://github.com/paritytech/rhododendron.git#7532b9772daa97bfb380faecbac5c5e41d0cff2a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "error-chain 0.12.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "futures 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
+ "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "rhododendron"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "error-chain 0.12.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
  "parity-codec 2.0.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "parity-codec-derive 2.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "rhododendron"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-dependencies = [
- "error-chain 0.12.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "futures 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
- "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -2972,10 +2964,10 @@ dependencies = [
  "error-chain 0.12.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.1.24 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.9 (registry+https://github.com/rust-lang/crates.io-index)",
- "parity-codec 1.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "parity-codec 2.0.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "parity-codec-derive 2.0.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "parking_lot 0.4.8 (registry+https://github.com/rust-lang/crates.io-index)",
- "rhododendron 0.3.4 (git+https://github.com/paritytech/rhododendron.git)",
+ "rhododendron 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 1.0.79 (registry+https://github.com/rust-lang/crates.io-index)",
  "sr-io 0.1.0",
  "sr-primitives 0.1.0",
@@ -4294,7 +4286,6 @@ dependencies = [
 "checksum openssl-sys 0.9.36 (registry+https://github.com/rust-lang/crates.io-index)" = "409d77eeb492a1aebd6eb322b2ee72ff7c7496b4434d98b3bf8be038755de65e"
 "checksum owning_ref 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)" = "cdf84f41639e037b484f93433aa3897863b561ed65c6e59c7073d7c561710f37"
 "checksum parity-bytes 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "fa5168b4cf41f3835e4bc6ffb32f51bc9365dc50cb351904595b3931d917fd0c"
-"checksum parity-codec 1.1.1 (registry+https://github.com/rust-lang/crates.io-index)" = "bee4edfcfa19892f7178cb299a659866015dc131459865a1d808269cf7e7eb9e"
 "checksum parity-codec 2.0.3 (registry+https://github.com/rust-lang/crates.io-index)" = "63c4b16ee2b7d6aace13b09bb0d16ade6b90ef19b7ca1c6cec9b8d08b9f59ecb"
 "checksum parity-codec-derive 2.0.4 (registry+https://github.com/rust-lang/crates.io-index)" = "693976dd8dd73d0c06ea8f339046903684e9d6a66e915ec0186b7baad43e7945"
 "checksum parity-crypto 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "c1117f6574377d21309bfa1f7d69ff734120685d92b02c3f362b122585758840"
@@ -4337,8 +4328,8 @@ dependencies = [
 "checksum regex-syntax 0.5.6 (registry+https://github.com/rust-lang/crates.io-index)" = "7d707a4fa2637f2dca2ef9fd02225ec7661fe01a53623c1e6515b6916511f7a7"
 "checksum regex-syntax 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)" = "747ba3b235651f6e2f67dfa8bcdcd073ddb7c243cb21c442fc12395dfcac212d"
 "checksum remove_dir_all 0.5.1 (registry+https://github.com/rust-lang/crates.io-index)" = "3488ba1b9a2084d38645c4c08276a1752dcbf2c7130d74f1569681ad5d2799c5"
-"checksum rhododendron 0.3.4 (git+https://github.com/paritytech/rhododendron.git)" = "<none>"
 "checksum rhododendron 0.3.4 (registry+https://github.com/rust-lang/crates.io-index)" = "e20523445e693f394c0e487113ae656071311c9ee4c1e914441bece8c929b21d"
+"checksum rhododendron 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)" = "a09bc21b21795c366c8bf0e87afb71175f5f736b3a5b279b6f4e81839d0a877b"
 "checksum ring 0.12.1 (registry+https://github.com/rust-lang/crates.io-index)" = "6f7d28b30a72c01b458428e0ae988d4149c20d902346902be881e3edc4bb325c"
 "checksum rust-crypto 0.2.36 (registry+https://github.com/rust-lang/crates.io-index)" = "f76d05d3993fd5f4af9434e8e436db163a12a9d40e1a58a726f27a01dfd12a2a"
 "checksum rustc-demangle 0.1.9 (registry+https://github.com/rust-lang/crates.io-index)" = "bcfe5b13211b4d78e5c2cadfebd7769197d95c639c35a50057eb4c05de811395"

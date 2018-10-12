@@ -54,7 +54,6 @@ extern crate futures;
 #[macro_use]
 extern crate error_chain;
 
-#[macro_use]
 extern crate serde;
 
 #[macro_use]
@@ -65,6 +64,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Instant, Duration};
 
 use codec::{Decode, Encode};
+use consensus_common::error::{ErrorKind as CommonErrorKind};
 use consensus_common::{Authorities, BlockImport, Environment, Proposer as BaseProposer};
 use runtime_primitives::{generic::BlockId, Justification};
 use runtime_primitives::traits::{Block, Header};
@@ -79,9 +79,10 @@ pub use rhododendron::{
 	InputStreamConcluded, AdvanceRoundReason, Message as RhdMessage,
 	Vote as RhdMessageVote, Communication as RhdCommunication,
 };
-pub use consensus_common::error::{Error, ErrorKind};
+pub use self::error::{Error, ErrorKind};
 
 // pub mod misbehaviour_check;
+mod error;
 
 // statuses for an agreement
 mod status {
@@ -98,7 +99,6 @@ pub type LocalizedMessage<B> = rhododendron::LocalizedMessage<
 	LocalizedSignature
 >;
 
-
 /// Justification of some hash.
 pub struct RhdJustification<H>(rhododendron::Justification<H, LocalizedSignature>);
 
@@ -106,11 +106,12 @@ pub struct RhdJustification<H>(rhododendron::Justification<H, LocalizedSignature
 pub struct PrepareJustification<H>(rhododendron::PrepareJustification<H, LocalizedSignature>);
 
 /// Unchecked justification.
+#[derive(Encode, Decode)]
 pub struct UncheckedJustification<H>(rhododendron::UncheckedJustification<H, LocalizedSignature>);
 
 impl<H> UncheckedJustification<H> {
 	/// Create a new, unchecked justification.
-	pub fn new(digest: H, signatures: Vec<LocalizedSignature>, round_number: usize) -> Self {
+	pub fn new(digest: H, signatures: Vec<LocalizedSignature>, round_number: u32) -> Self {
 		UncheckedJustification(rhododendron::UncheckedJustification {
 			digest,
 			signatures,
@@ -119,40 +120,24 @@ impl<H> UncheckedJustification<H> {
 	}
 }
 
-impl<H> Into<Justification> for RhdJustification<H> {
-	fn into(self) -> Justification {
-		let p : Justification = UncheckedJustification(self.0.uncheck()).into();
-		p
+impl<H: Decode> UncheckedJustification<H> {
+	/// Decode a justification.
+	pub fn decode_justification(justification: Justification) -> Option<Self> {
+		let inner: rhododendron::UncheckedJustification<_, _> = Decode::decode(&mut &justification[..])?;
+
+		Some(UncheckedJustification(inner))
 	}
 }
 
+impl<H: Encode> Into<Justification> for UncheckedJustification<H> {
+	fn into(self) -> Justification {
+		self.0.encode()
+	}
+}
 
 impl<H> From<rhododendron::UncheckedJustification<H, LocalizedSignature>> for UncheckedJustification<H> {
 	fn from(inner: rhododendron::UncheckedJustification<H, LocalizedSignature>) -> Self {
 		UncheckedJustification(inner)
-	}
-}
-
-impl<H> From<Justification> for UncheckedJustification<H> {
-	fn from(just: Justification) -> Self {
-		UncheckedJustification(rhododendron::UncheckedJustification {
-			round_number: just.round_number as usize,
-			digest: just.hash,
-			signatures: just.signatures.into_iter().map(|(from, sig)| LocalizedSignature {
-				signer: from.into(),
-				signature: sig,
-			}).collect(),
-		})
-	}
-}
-
-impl<H> Into<Justification> for UncheckedJustification<H> {
-	fn into(self) -> Justification {
-		Justification {
-			round_number: self.0.round_number as u32,
-			hash: self.0.digest,
-			signatures: self.0.signatures.into_iter().map(|s| (s.signer.into(), s.signature)).collect(),
-		}
 	}
 }
 
@@ -166,19 +151,16 @@ pub type Communication<B> = rhododendron::Communication<B, <B as Block>::Hash, A
 pub type Misbehavior<H> = rhododendron::Misbehavior<H, LocalizedSignature>;
 
 /// A proposer for a rhododendron instance. This must implement the base proposer logic.
-pub trait Proposer<B: Block>: BaseProposer<B>
-	where
-	<Self as BaseProposer<B>>::Error: From<rhododendron::InputStreamConcluded>
-{
+pub trait Proposer<B: Block>: BaseProposer<B, Error=Error> {
 	/// Import witnessed rhododendron misbehavior.
 	fn import_misbehavior(&self, misbehavior: Vec<(AuthorityId, Misbehavior<B::Hash>)>);
 
 	/// Determine the proposer for a given round. This should be a deterministic function
 	/// with consistent results across all authorities.
-	fn round_proposer(&self, round_number: usize, authorities: &[AuthorityId]) -> AuthorityId;
+	fn round_proposer(&self, round_number: u32, authorities: &[AuthorityId]) -> AuthorityId;
 
 	/// Hook called when a BFT round advances without a proposal.
-	fn on_round_end(&self, _round_number: usize, _proposed: bool) { }
+	fn on_round_end(&self, _round_number: u32, _proposed: bool) { }
 }
 
 // caches the round number to start at if we end up with BFT consensus on the same
@@ -189,7 +171,7 @@ pub trait Proposer<B: Block>: BaseProposer<B>
 #[derive(Debug)]
 struct RoundCache<H> {
 	hash: Option<H>,
-	start_round: usize,
+	start_round: u32,
 }
 
 /// Instance of BFT agreement.
@@ -208,13 +190,13 @@ impl<B: Block, P: Proposer<B>> BftInstance<B, P>
 		B::Hash: ::std::hash::Hash
 
 {
-	fn round_timeout_duration(&self, round: usize) -> Duration {
+	fn round_timeout_duration(&self, round: u32) -> Duration {
 		// 2^(min(6, x/8)) * 10
 		// Grows exponentially starting from 10 seconds, capped at 640 seconds.
-		const ROUND_INCREMENT_STEP: usize = 8;
+		const ROUND_INCREMENT_STEP: u32 = 8;
 
 		let round = round / ROUND_INCREMENT_STEP;
-		let round = ::std::cmp::min(6, round) as u32;
+		let round = ::std::cmp::min(6, round);
 
 		let timeout = 1u64.checked_shl(round)
 			.unwrap_or_else(u64::max_value)
@@ -223,7 +205,7 @@ impl<B: Block, P: Proposer<B>> BftInstance<B, P>
 		Duration::from_secs(timeout)
 	}
 
-	fn update_round_cache(&self, current_round: usize) {
+	fn update_round_cache(&self, current_round: u32) {
 		let mut cache = self.cache.lock();
 		if cache.hash.as_ref() == Some(&self.parent_hash) {
 			cache.start_round = current_round + 1;
@@ -261,7 +243,7 @@ impl<B: Block, P: Proposer<B>> rhododendron::Context for BftInstance<B, P>
 		sign_message(message, &*self.key, self.parent_hash.clone())
 	}
 
-	fn round_proposer(&self, round: usize) -> AuthorityId {
+	fn round_proposer(&self, round: u32) -> AuthorityId {
 		self.proposer.round_proposer(round, &self.authorities[..])
 	}
 
@@ -269,10 +251,10 @@ impl<B: Block, P: Proposer<B>> rhododendron::Context for BftInstance<B, P>
 		self.proposer.evaluate(proposal).into_future()
 	}
 
-	fn begin_round_timeout(&self, round: usize) -> Self::RoundTimeout {
+	fn begin_round_timeout(&self, round: u32) -> Self::RoundTimeout {
 		let timeout = self.round_timeout_duration(round);
 		let fut = Delay::new(Instant::now() + timeout)
-			.map_err(|e| Error::from(ErrorKind::FaultyTimer(e)))
+			.map_err(|e| Error::from(CommonErrorKind::FaultyTimer(e)))
 			.map_err(Into::into);
 
 		Box::new(fut)
@@ -281,8 +263,8 @@ impl<B: Block, P: Proposer<B>> rhododendron::Context for BftInstance<B, P>
 	fn on_advance_round(
 		&self,
 		accumulator: &::rhododendron::Accumulator<B, B::Hash, Self::AuthorityId, Self::Signature>,
-		round: usize,
-		next_round: usize,
+		round: u32,
+		next_round: u32,
 		reason: AdvanceRoundReason,
 	) {
 		use std::collections::HashSet;
@@ -313,8 +295,9 @@ pub struct BftFuture<B, P, I, InStream, OutSink> where
 	B: Block + Clone + Eq,
 	B::Hash: ::std::hash::Hash,
 	P: Proposer<B>,
-	InStream: Stream<Item=Communication<B>, Error=P::Error>,
-	OutSink: Sink<SinkItem=Communication<B>, SinkError=P::Error>,
+	P: BaseProposer<B, Error=Error>,
+	InStream: Stream<Item=Communication<B>, Error=Error>,
+	OutSink: Sink<SinkItem=Communication<B>, SinkError=Error>,
 {
 	inner: rhododendron::Agreement<BftInstance<B, P>, InStream, OutSink>,
 	status: Arc<AtomicUsize>,
@@ -326,10 +309,10 @@ impl<B, P, I, InStream, OutSink> Future for BftFuture<B, P, I, InStream, OutSink
 	B: Block + Clone + Eq,
 	B::Hash: ::std::hash::Hash,
 	P: Proposer<B>,
-	P::Error: ::std::fmt::Display + From<InputStreamConcluded>,
+	P: BaseProposer<B, Error=Error>,
 	I: BlockImport<B>,
-	InStream: Stream<Item=Communication<B>, Error=P::Error>,
-	OutSink: Sink<SinkItem=Communication<B>, SinkError=P::Error>,
+	InStream: Stream<Item=Communication<B>, Error=Error>,
+	OutSink: Sink<SinkItem=Communication<B>, SinkError=Error>,
 {
 	type Item = ();
 	type Error = ();
@@ -358,7 +341,7 @@ impl<B, P, I, InStream, OutSink> Future for BftFuture<B, P, I, InStream, OutSink
 			let hash = justified_block.hash();
 			info!(target: "bft", "Importing block #{} ({}) directly from BFT consensus",
 				justified_block.header().number(), hash);
-			let just : Justification = RhdJustification(committed.justification).into();
+			let just: Justification = UncheckedJustification(committed.justification.uncheck()).into();
 
 			let import_ok = self.import.import_block(
 				justified_block,
@@ -388,9 +371,9 @@ impl<B, P, I, InStream, OutSink> Drop for BftFuture<B, P, I, InStream, OutSink> 
 	B: Block + Clone + Eq,
 	B::Hash: ::std::hash::Hash,
 	P: Proposer<B>,
-	P::Error: From<InputStreamConcluded>,
-	InStream: Stream<Item=Communication<B>, Error=P::Error>,
-	OutSink: Sink<SinkItem=Communication<B>, SinkError=P::Error>,
+	P: BaseProposer<B, Error=Error>,
+	InStream: Stream<Item=Communication<B>, Error=Error>,
+	OutSink: Sink<SinkItem=Communication<B>, SinkError=Error>,
 {
 	fn drop(&mut self) {
 		// TODO: have a trait member to pass misbehavior reports into.
@@ -418,9 +401,6 @@ impl Drop for AgreementHandle {
 	}
 }
 
-/// Type alias for extracting error type from a rhododendron proposer.
-pub type ProposerErrorFor<B, E> = <<E as Environment<B>>::Proposer as BaseProposer<B>>::Error;
-
 /// The BftService kicks off the agreement process on top of any blocks it
 /// is notified of.
 ///
@@ -439,7 +419,7 @@ impl<B, P, I> BftService<B, P, I>
 		B: Block + Clone + Eq,
 		P: Environment<B>,
 		P::Proposer: Proposer<B>,
-		ProposerErrorFor<B, P>: ::std::fmt::Display + From<InputStreamConcluded>,
+		P::Proposer: BaseProposer<B,Error=Error>,
 		I: BlockImport<B> + Authorities<B>,
 {
 	/// Create a new service instance.
@@ -485,8 +465,8 @@ impl<B, P, I> BftService<B, P, I>
 				Out,
 			>>, P::Error>
 		where
-			In: Stream<Item=Communication<B>, Error=ProposerErrorFor<B, P>>,
-			Out: Sink<SinkItem=Communication<B>, SinkError=ProposerErrorFor<B, P>>,
+			In: Stream<Item=Communication<B>, Error=Error>,
+			Out: Sink<SinkItem=Communication<B>, SinkError=Error>,
 	{
 		let hash = header.hash();
 
@@ -510,7 +490,7 @@ impl<B, P, I> BftService<B, P, I>
 		if !authorities.contains(&local_id) {
 			// cancel current agreement
 			live_agreement.take();
-			Err(ErrorKind::InvalidAuthority(local_id).into())?;
+			Err(CommonErrorKind::InvalidAuthority(local_id).into())?;
 		}
 
 		let proposer = self.factory.init(header, &authorities, self.key.clone())?;
@@ -628,7 +608,7 @@ impl<B: Block, S: Stream<Item=Vec<u8>>> Stream for CheckedStream<B, S>
 	type Item = Communication<B>;
 	type Error = S::Error;
 
-	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+	fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
 		use rhododendron::LocalizedMessage as RhdLocalized;
 		loop {
 			match self.inner.poll()? {
@@ -646,10 +626,14 @@ impl<B: Block, S: Stream<Item=Vec<u8>>> Stream for CheckedStream<B, S>
 								UncheckedJustification(prepare_just.uncheck()),
 							);
 							if let Ok(checked) = checked {
-								return RhdCommunication::Auxiliary(checked.0);
+								return Ok(Async::Ready(
+									Some(RhdCommunication::Auxiliary(checked.0))
+								));
 							}
 						}
 						RhdCommunication::Consensus(RhdLocalized::Propose(p)) => {
+							if p.sender == self.local_id { continue }
+
 							let checked = check_proposal::<B>(
 								&self.authorities,
 								&self.parent_hash,
@@ -657,10 +641,14 @@ impl<B: Block, S: Stream<Item=Vec<u8>>> Stream for CheckedStream<B, S>
 							);
 
 							if let Ok(()) = checked {
-								return RhdCommunication::Consensus(RhdLocalized::Propose(p));
+								return Ok(Async::Ready(
+									Some(RhdCommunication::Consensus(RhdLocalized::Propose(p)))
+								));
 							}
 						}
 						RhdCommunication::Consensus(RhdLocalized::Vote(v)) => {
+							if v.sender == self.local_id { continue }
+
 							let checked = check_vote::<B>(
 								&self.authorities,
 								&self.parent_hash,
@@ -668,21 +656,18 @@ impl<B: Block, S: Stream<Item=Vec<u8>>> Stream for CheckedStream<B, S>
 							);
 
 							if let Ok(()) = checked {
-								return RhdCommunication::Consensus(RhdLocalized::Vote(v));
+								return Ok(Async::Ready(
+									Some(RhdCommunication::Consensus(RhdLocalized::Vote(v)))
+								));
 							}
 						}
 					}
 				}
-				Async::Ready(None) => return Async::Ready(None),
+				Async::Ready(None) => return Ok(Async::Ready(None)),
 				Async::NotReady => return Ok(Async::NotReady),
 			}
 		}
 	}
-}
-
-/// Convert an input-stream-concluded error into an error.
-pub fn input_stream_concluded(_: ::rhododendron::InputStreamConcluded) -> Error {
-	ErrorKind::IoTerminated.into()
 }
 
 /// Given a total number of authorities, yield the maximum faulty that would be allowed.
@@ -699,12 +684,12 @@ pub fn bft_threshold(n: usize) -> usize {
 
 // actions in the signature scheme.
 #[derive(Encode)]
-enum Action<B: Block> {
-	Prepare(u32, B::Hash),
-	Commit(u32, B::Hash),
+enum Action<B, H> {
+	Prepare(u32, H),
+	Commit(u32, H),
 	AdvanceRound(u32),
 	// signatures of header hash and full candidate are both included.
-	ProposeHeader(u32, B::Hash),
+	ProposeHeader(u32, H),
 	Propose(u32, B),
 }
 
@@ -740,7 +725,7 @@ pub fn check_justification<B: Block>(
 	parent: B::Hash,
 	just: UncheckedJustification<B::Hash>
 ) -> Result<RhdJustification<B::Hash>, UncheckedJustification<B::Hash>> {
-	let vote = Action::<B>::Commit(just.0.round_number as u32, just.0.digest.clone());
+	let vote: Action<B, B::Hash> = Action::Commit(just.0.round_number as u32, just.0.digest.clone());
 	let message = localized_encode(parent, vote);
 
 	check_justification_signed_message(authorities, &message[..], just)
@@ -753,7 +738,7 @@ pub fn check_justification<B: Block>(
 pub fn check_prepare_justification<B: Block>(authorities: &[AuthorityId], parent: B::Hash, just: UncheckedJustification<B::Hash>)
 	-> Result<PrepareJustification<B::Hash>, UncheckedJustification<B::Hash>>
 {
-	let vote = Action::<B>::Prepare(just.0.round_number as u32, just.0.digest.clone());
+	let vote: Action<B, B::Hash> = Action::Prepare(just.0.round_number as u32, just.0.digest.clone());
 	let message = localized_encode(parent, vote);
 
 	check_justification_signed_message(authorities, &message[..], just).map(|e| PrepareJustification(e.0))
@@ -768,7 +753,7 @@ pub fn check_proposal<B: Block + Clone>(
 	-> Result<(), Error>
 {
 	if !authorities.contains(&propose.sender) {
-		return Err(ErrorKind::InvalidAuthority(propose.sender.into()).into());
+		return Err(CommonErrorKind::InvalidAuthority(propose.sender.into()).into());
 	}
 
 	let action_header = Action::ProposeHeader(propose.round_number as u32, propose.digest.clone());
@@ -786,7 +771,7 @@ pub fn check_vote<B: Block>(
 	-> Result<(), Error>
 {
 	if !authorities.contains(&vote.sender) {
-		return Err(ErrorKind::InvalidAuthority(vote.sender.into()).into());
+		return Err(CommonErrorKind::InvalidAuthority(vote.sender.into()).into());
 	}
 
 	let action = match vote.vote {
@@ -797,12 +782,12 @@ pub fn check_vote<B: Block>(
 	check_action::<B>(action, parent_hash, &vote.signature)
 }
 
-fn check_action<B: Block>(action: Action<B>, parent_hash: &B::Hash, sig: &LocalizedSignature) -> Result<(), Error> {
+fn check_action<B: Block>(action: Action<B, B::Hash>, parent_hash: &B::Hash, sig: &LocalizedSignature) -> Result<(), Error> {
 	let message = localized_encode(*parent_hash, action);
 	if ed25519::verify_strong(&sig.signature, &message, &sig.signer) {
 		Ok(())
 	} else {
-		Err(ErrorKind::InvalidSignature(sig.signature.into(), sig.signer.clone().into()).into())
+		Err(CommonErrorKind::InvalidSignature(sig.signature.into(), sig.signer.clone().into()).into())
 	}
 }
 
@@ -814,7 +799,7 @@ pub fn sign_message<B: Block + Clone>(
 ) -> LocalizedMessage<B> {
 	let signer = key.public();
 
-	let sign_action = |action: Action<B>| {
+	let sign_action = |action: Action<B, B::Hash>| {
 		let to_sign = localized_encode(parent_hash.clone(), action);
 
 		LocalizedSignature {
@@ -858,6 +843,8 @@ pub fn sign_message<B: Block + Clone>(
 mod tests {
 	use super::*;
 	use std::collections::HashSet;
+	use std::marker::PhantomData;
+
 	use runtime_primitives::testing::{Block as GenericTestBlock, Header as TestHeader};
 	use primitives::H256;
 	use self::keyring::Keyring;
@@ -879,7 +866,7 @@ mod tests {
 	}
 
 	impl Authorities<TestBlock> for FakeClient {
-		fn authorities(&self, _at: &BlockId<TestBlock>) -> Result<Vec<AuthorityId>, Error> {
+		fn authorities(&self, _at: &BlockId<TestBlock>) -> Result<Vec<AuthorityId>, ::consensus_common::Error> {
 			Ok(self.authorities.clone())
 		}
 	}
@@ -914,18 +901,16 @@ mod tests {
 
 	impl Environment<TestBlock> for DummyFactory {
 		type Proposer = DummyProposer;
-		type Input = Comms<Error>;
-		type Output = Comms<Error>;
 		type Error = Error;
 
 		fn init(&self, parent_header: &TestHeader, _authorities: &[AuthorityId], _sign_with: Arc<ed25519::Pair>)
-			-> Result<(DummyProposer, Self::Input, Self::Output), Error>
+			-> Result<DummyProposer, Error>
 		{
-			Ok((DummyProposer(parent_header.number + 1), Comms(::std::marker::PhantomData), Comms(::std::marker::PhantomData)))
+			Ok(DummyProposer(parent_header.number + 1))
 		}
 	}
 
-	impl Proposer<TestBlock> for DummyProposer {
+	impl BaseProposer<TestBlock> for DummyProposer {
 		type Error = Error;
 		type Create = Result<TestBlock, Error>;
 		type Evaluate = Result<bool, Error>;
@@ -941,11 +926,13 @@ mod tests {
 		fn evaluate(&self, proposal: &TestBlock) -> Result<bool, Error> {
 			Ok(proposal.header.number == self.0)
 		}
+	}
 
+	impl Proposer<TestBlock> for DummyProposer {
 		fn import_misbehavior(&self, _misbehavior: Vec<(AuthorityId, Misbehavior<H256>)>) {}
 
-		fn round_proposer(&self, round_number: usize, authorities: &[AuthorityId]) -> AuthorityId {
-			authorities[round_number % authorities.len()].clone()
+		fn round_proposer(&self, round_number: u32, authorities: &[AuthorityId]) -> AuthorityId {
+			authorities[(round_number as usize) % authorities.len()].clone()
 		}
 	}
 
@@ -1003,10 +990,10 @@ mod tests {
 		second.parent_hash = first_hash;
 		let _second_hash = second.hash();
 
-		let mut first_bft = service.build_upon(&first).unwrap().unwrap();
+		let mut first_bft = service.build_upon(&first, Comms(PhantomData), Comms(PhantomData)).unwrap().unwrap();
 		assert!(service.live_agreement.lock().as_ref().unwrap().0 == first);
 
-		let _second_bft = service.build_upon(&second).unwrap();
+		let _second_bft = service.build_upon(&second, Comms(PhantomData), Comms(PhantomData)).unwrap();
 		assert!(service.live_agreement.lock().as_ref().unwrap().0 != first);
 		assert!(service.live_agreement.lock().as_ref().unwrap().0 == second);
 
@@ -1174,7 +1161,7 @@ mod tests {
 		let mut second = from_block_number(3);
 		second.parent_hash = first_hash;
 
-		let _ = service.build_upon(&first).unwrap();
+		let _ = service.build_upon(&first, Comms(PhantomData), Comms(PhantomData)).unwrap();
 		assert!(service.live_agreement.lock().as_ref().unwrap().0 == first);
 		service.live_agreement.lock().take();
 	}
@@ -1202,14 +1189,14 @@ mod tests {
 		let mut third = from_block_number(4);
 		third.parent_hash = second.hash();
 
-		let _ = service.build_upon(&first).unwrap();
+		let _ = service.build_upon(&first, Comms(PhantomData), Comms(PhantomData)).unwrap();
 		assert!(service.live_agreement.lock().as_ref().unwrap().0 == first);
 		// BFT has not seen second, but will move forward on third
-		service.build_upon(&third).unwrap();
+		service.build_upon(&third, Comms(PhantomData), Comms(PhantomData)).unwrap();
 		assert!(service.live_agreement.lock().as_ref().unwrap().0 == third);
 
 		// but we are not walking backwards
-		service.build_upon(&second).unwrap();
+		service.build_upon(&second, Comms(PhantomData), Comms(PhantomData)).unwrap();
 		assert!(service.live_agreement.lock().as_ref().unwrap().0 == third);
 	}
 }
